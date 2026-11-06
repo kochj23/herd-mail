@@ -16,6 +16,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`Drafts`, `INBOX.Drafts`, `[Gmail]/Drafts`), or set explicitly with
   `--draft-folder`. Threading headers (`--message-id`) and `--rich` HTML work
   the same as a normal send; header values are CRLF-sanitized against injection.
+  `--draft` never sends, so `--no-save-sent` is a harmless no-op alongside it
+  (an info note is logged).
+
+## [3.4.0] - 2026-07-10
+
+### Fixed
+
+- **UID→sequence-number resolution (#14):** Removed the remaining
+  `uid_to_sequence_number()` / `resolve_sequence_to_uids()` round-trips from
+  `send --message-id`, `list`, `check`, `download`, and `move`. waggle 1.9.12+
+  uses UID-based IMAP commands and `list_inbox()` already returns real UIDs, so
+  the conversion mapped valid UIDs to stale sequence numbers — silently dropping
+  `In-Reply-To`/`References` threading headers on replies and raising
+  `Invalid messageset` on list/flag. All commands now pass the real UID directly
+  (mirrors the 3.1.1 `cmd_read` fix).
+
+- **`--rich` Markdown lists without a preceding blank line (#11):** A bullet or
+  numbered list placed directly under a paragraph (e.g. `**Header:**` then
+  `- item`) rendered as inline text instead of an HTML `<ul>`/`<ol>`, because
+  CommonMark requires a blank line before a block-level list. `send --rich` now
+  pre-processes the body to insert the missing blank line before such lists.
+  Already-separated lists, consecutive items, indented continuations, `---`
+  rules, and the `-----Original Message-----` quote banner are left untouched.
 
 ## [3.3.0] - 2026-06-17
 

@@ -32,7 +32,7 @@ Author: O.C.
 License: MIT
 """
 
-__version__ = "3.3.0"
+__version__ = "3.5.0-rc1"
 
 import argparse
 import datetime
@@ -146,7 +146,7 @@ try:
     from waggle import (
         send_email, check_recently_sent, read_message,
         list_inbox, download_attachments, move_message,
-        set_flags, clear_flags,
+        set_flags, clear_flags, search_messages,
     )
     WAGGLE_AVAILABLE = True
 except ImportError as e:
@@ -171,6 +171,15 @@ except ImportError as e:
         raise RuntimeError("waggle not installed")
 
     def move_message(*args, **kwargs):
+        raise RuntimeError("waggle not installed")
+
+    def set_flags(*args, **kwargs):
+        raise RuntimeError("waggle not installed")
+
+    def clear_flags(*args, **kwargs):
+        raise RuntimeError("waggle not installed")
+
+    def search_messages(*args, **kwargs):
         raise RuntimeError("waggle not installed")
 
 
@@ -359,6 +368,42 @@ def decode_escape_sequences(text: str) -> str:
         result = result.replace(escaped, actual)
 
     return result
+
+
+# Matches a Markdown list item at the start of a line: unordered ("- ", "* ",
+# "+ ") or ordered ("1. ", "2) "). Requires whitespace + content after the
+# marker, so horizontal rules ("---") and quote banners ("-----Original ...")
+# — which have no space after the dashes — are deliberately NOT matched.
+_LIST_ITEM_RE = re.compile(r'^\s*(?:[-*+]|\d+[.)])\s+\S')
+
+
+def ensure_blank_line_before_lists(text: str) -> str:
+    """Insert a blank line before a Markdown list not already preceded by one.
+
+    CommonMark requires a blank line between a paragraph and a following list;
+    without it a line like ``- Item`` renders as literal inline text instead of
+    an HTML ``<ul><li>``. This inserts the missing blank line so ``--rich`` HTML
+    renders lists correctly (issue #11), while leaving untouched:
+
+    - lists that are already correctly separated,
+    - consecutive list items (a blank line is only added before the FIRST item),
+    - indented continuation lines (to avoid breaking nested list content),
+    - non-list lines such as ``---`` rules or ``-----Original Message-----``.
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    out: list[str] = []
+    for line in lines:
+        if _LIST_ITEM_RE.match(line) and out:
+            prev = out[-1]
+            # Only insert when the previous line is a non-blank, non-indented,
+            # non-list line (i.e. the end of a paragraph directly above a list).
+            if prev.strip() and not prev[:1].isspace() and not _LIST_ITEM_RE.match(prev):
+                out.append('')
+        out.append(line)
+    return '\n'.join(out)
 
 
 def parse_port(port_str: str, default: int, port_name: str = "port") -> int:
@@ -746,117 +791,6 @@ def imap_append_draft(
             pass
 
 
-def resolve_sequence_to_uids(
-    cfg: dict[str, Any],
-    messages: list[dict[str, Any]],
-    folder: str = DEFAULT_IMAP_FOLDER,
-) -> list[dict[str, Any]]:
-    """
-    Replace waggle's sequence-number "uid" fields with actual IMAP UIDs.
-
-    waggle's list_inbox() returns sequence numbers labeled as "uid".
-    This function connects via IMAP, fetches all UIDs, builds a
-    sequence-number-to-UID mapping, and patches each message dict in place.
-
-    Returns:
-        The same messages list with "uid" fields replaced by real UIDs.
-        Messages whose sequence numbers can't be mapped are left unchanged.
-    """
-    if not messages:
-        return messages
-
-    wcfg = build_waggle_config(cfg)
-    ctx = ssl.create_default_context()
-
-    try:
-        if wcfg.get("imap_tls", True):
-            conn = imaplib.IMAP4_SSL(
-                wcfg["imap_host"], wcfg.get("imap_port", DEFAULT_IMAP_PORT),
-                ssl_context=ctx,
-            )
-        else:
-            conn = imaplib.IMAP4(wcfg["imap_host"], wcfg.get("imap_port", DEFAULT_IMAP_PORT))
-
-        try:
-            conn.login(wcfg["user"], wcfg["password"])
-            status, _ = conn.select(folder, readonly=True)
-            if status != "OK":
-                logger.warning(f"Could not select folder {folder!r} for UID resolution")
-                return messages
-
-            for msg in messages:
-                seq = str(msg.get("uid", ""))
-                if not seq:
-                    continue
-                status, data = conn.fetch(seq, "(UID)")
-                if status == "OK" and data and data[0]:
-                    match = re.search(rb"UID\s+(\d+)", data[0])
-                    if match:
-                        msg["uid"] = match.group(1).decode()
-
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
-
-    except (OSError, imaplib.IMAP4.error) as e:
-        logger.warning(f"Could not resolve UIDs (flags may not work correctly): {e}")
-
-    return messages
-
-
-def uid_to_sequence_number(
-    cfg: dict[str, Any],
-    uid: str,
-    folder: str = DEFAULT_IMAP_FOLDER,
-) -> Optional[str]:
-    """
-    Convert a real IMAP UID to its sequence number.
-
-    Waggle functions expect sequence numbers, so when the user provides a
-    real UID (from our resolved list output), we need to convert it back.
-
-    Returns the sequence number as a string, or None if not found.
-    """
-    wcfg = build_waggle_config(cfg)
-    ctx = ssl.create_default_context()
-
-    try:
-        if wcfg.get("imap_tls", True):
-            conn = imaplib.IMAP4_SSL(
-                wcfg["imap_host"], wcfg.get("imap_port", DEFAULT_IMAP_PORT),
-                ssl_context=ctx,
-            )
-        else:
-            conn = imaplib.IMAP4(wcfg["imap_host"], wcfg.get("imap_port", DEFAULT_IMAP_PORT))
-
-        try:
-            conn.login(wcfg["user"], wcfg["password"])
-            status, _ = conn.select(folder, readonly=True)
-            if status != "OK":
-                return None
-
-            uid_bytes = uid.encode() if isinstance(uid, str) else uid
-            status, data = conn.uid("FETCH", uid_bytes, "(UID)")
-            if status == "OK" and data and data[0]:
-                match = re.match(rb"^(\d+)\s+\(UID\s+\d+\)", data[0])
-                if match:
-                    return match.group(1).decode()
-
-            return None
-
-        finally:
-            try:
-                conn.logout()
-            except Exception:
-                pass
-
-    except (OSError, imaplib.IMAP4.error) as e:
-        logger.warning(f"Could not convert UID {uid} to sequence number: {e}")
-        return None
-
-
 def output_json(data: dict[str, Any]) -> None:
     """Write JSON to stdout. All logging must go to stderr."""
     print(json.dumps(data, indent=2, default=str))
@@ -981,6 +915,11 @@ def cmd_send(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
         else:
             body = DEFAULT_NO_BODY_MESSAGE
 
+    # --rich: ensure Markdown lists are preceded by a blank line so they render
+    # as real HTML lists rather than inline text (CommonMark block rule, #11).
+    if args.rich and body:
+        body = ensure_blank_line_before_lists(body)
+
     # Check for duplicates (unless skipped, or drafting — a draft isn't a send)
     if not args.skip_duplicate_check and not args.draft:
         try:
@@ -1007,11 +946,12 @@ def cmd_send(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     if args.message_id:
         try:
             logger.info(f"Fetching original message {args.message_id} for threading...")
-            # Convert UID to sequence number for waggle
-            seq_num = uid_to_sequence_number(cfg, args.message_id, folder=DEFAULT_IMAP_FOLDER)
-            waggle_id = seq_num if seq_num else args.message_id
+            # waggle 1.9.12+ uses UID-based IMAP commands (m.uid("FETCH", ...)).
+            # Pass the real UID directly — no sequence-number conversion (see cmd_read).
+            # The old UID->sequence round-trip mapped valid UIDs to stale/wrong
+            # sequence numbers, silently dropping In-Reply-To/References headers.
             original = read_message(
-                waggle_id,
+                args.message_id,
                 folder=DEFAULT_IMAP_FOLDER,
                 config=build_waggle_config(cfg)
             )
@@ -1034,6 +974,9 @@ def cmd_send(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     # drafted reply threads correctly; footer + duplicate check are skipped since
     # nothing is being sent.
     if args.draft:
+        if args.no_save_sent:
+            # Nothing is sent, so there is no Sent copy to skip — harmless no-op.
+            logger.info("--no-save-sent has no effect with --draft (nothing is sent)")
         try:
             msg_bytes = build_draft_message(
                 cfg,
@@ -1088,11 +1031,15 @@ def cmd_send(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
             references=references,
             attachments=args.attachment,
             rich=args.rich,
+            save_sent=not args.no_save_sent,
             config=build_waggle_config(cfg),
         )
 
         logger.info("Email sent successfully!")
-        logger.info("  (Saved to Sent folder via waggle)")
+        if not args.no_save_sent:
+            logger.info("  (Saved to Sent folder via waggle)")
+        else:
+            logger.info("  (Sent folder sync skipped --no-save-sent)")
 
         if args.message_id and cfg.get("imap_host"):
             try:
@@ -1165,8 +1112,10 @@ def cmd_list(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
         logger.error(f"Unexpected error listing messages: {e}")
         return 1
 
-    # Resolve waggle's sequence numbers to actual IMAP UIDs
-    messages = resolve_sequence_to_uids(cfg, messages, folder=args.folder)
+    # waggle 1.9.12+ list_inbox() returns real IMAP UIDs (m.uid("SEARCH"/"FETCH")),
+    # so no sequence-number resolution is needed. The old resolve step re-fetched
+    # each UID as if it were a sequence number, corrupting UIDs / raising
+    # "Invalid messageset" and breaking downstream flag operations.
 
     if args.unread:
         messages = [m for m in messages if m.get("unread")]
@@ -1247,8 +1196,7 @@ def cmd_check(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
         logger.error(f"Unexpected error checking messages: {e}")
         return 2
 
-    # Resolve waggle's sequence numbers to actual IMAP UIDs
-    messages = resolve_sequence_to_uids(cfg, messages, folder=args.folder)
+    # waggle 1.9.12+ list_inbox() already returns real IMAP UIDs; no resolution needed.
 
     unread = [m for m in messages if m.get("unread")]
 
@@ -1279,13 +1227,10 @@ def cmd_download(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
         logger.error(f"Cannot create destination directory: {e}")
         return 1
 
-    # Convert UID to sequence number for waggle
-    seq_num = uid_to_sequence_number(cfg, args.uid, folder=args.folder)
-    waggle_id = seq_num if seq_num else args.uid
-
+    # waggle 1.9.12+ uses UID-based IMAP commands; pass the real UID directly.
     try:
         files = download_attachments(
-            waggle_id,
+            args.uid,
             folder=args.folder,
             dest_dir=str(dest_dir),
             config=build_waggle_config(cfg),
@@ -1365,13 +1310,10 @@ def cmd_move(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     if not validate_config(cfg, require_smtp=False, require_imap=True):
         return 1
 
-    # Convert UID to sequence number for waggle
-    seq_num = uid_to_sequence_number(cfg, args.uid, folder=args.folder)
-    waggle_id = seq_num if seq_num else args.uid
-
+    # waggle 1.9.12+ uses UID-based IMAP commands; pass the real UID directly.
     try:
         move_message(
-            waggle_id,
+            args.uid,
             args.dest_folder,
             src_folder=args.folder,
             config=build_waggle_config(cfg),
@@ -1397,6 +1339,77 @@ def cmd_move(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
     return 0
 
 
+def output_human_search(data: dict[str, Any]) -> None:
+    """Write human-readable search results to stdout."""
+    messages = data.get("messages", [])
+    if not messages:
+        print("No messages found.")
+        return
+
+    print(f"{'UID':<8} {'Folder':<20} {'From':<30} {'Subject':<40} {'Date':<20} {'Status'}")
+    print("-" * 130)
+    for msg in messages:
+        status = "*" if msg.get("unread") else " "
+        from_name = msg.get("from_name", "")
+        from_addr = msg.get("from_addr", "")
+        from_display = f"{from_name} ({from_addr})" if from_name and from_addr else (from_name or from_addr or "")
+        subject = msg.get("subject", "(no subject)")
+        folder = msg.get("folder", "")
+        from_display = from_display[:28] if len(from_display) > 28 else from_display
+        subject = subject[:38] if len(subject) > 38 else subject
+        folder = folder[:18] if len(folder) > 18 else folder
+        date = msg.get("date", "")[:18]
+        print(f"{msg['uid']:<8} {folder:<20} {from_display:<30} {subject:<40} {date:<20} {status}")
+
+
+def cmd_search(args: argparse.Namespace, cfg: dict[str, Any]) -> int:
+    """Handle the search subcommand."""
+    if not validate_config(cfg, require_smtp=False, require_imap=True):
+        return 1
+
+    query: dict[str, Any] = {}
+    if args.from_addr:
+        query["from_addr"] = args.from_addr
+    if args.subject:
+        query["subject"] = args.subject
+    if args.text:
+        query["text"] = args.text
+    if args.since:
+        query["since"] = args.since
+    if args.unseen:
+        query["unseen"] = True
+
+    folders = args.folders.split(",") if args.folders else ["INBOX", "INBOX.Processed"]
+
+    try:
+        messages = search_messages(
+            query,
+            folders=folders,
+            limit=args.limit,
+            config=build_waggle_config(cfg),
+        )
+    except (ConnectionError, TimeoutError, OSError, RuntimeError) as e:
+        logger.error(f"Failed to search messages: {e}")
+        return 1
+    except Exception as e:
+        logger.error(f"Unexpected error searching messages: {e}")
+        return 1
+
+    data = {
+        "query": query,
+        "folders": folders,
+        "count": len(messages),
+        "messages": messages,
+    }
+
+    if args.human:
+        output_human_search(data)
+    else:
+        output_json(data)
+
+    return 0
+
+
 def get_folder_stats(
     cfg: dict[str, Any],
     folders: Optional[list[str]] = None,
@@ -1405,9 +1418,8 @@ def get_folder_stats(
     """Collect per-folder message counts via a single IMAP connection.
 
     For each folder returns total message count, unread (UNSEEN) count, and
-    the number of messages received within the last `days` days. Reuses the
-    same direct-IMAP pattern as resolve_sequence_to_uids() so it does not
-    depend on waggle's listing layer.
+    the number of messages received within the last `days` days. Uses a direct
+    IMAP connection so it does not depend on waggle's listing layer.
 
     Args:
         cfg: Configuration dictionary.
@@ -1581,6 +1593,7 @@ def main() -> int:
     send_parser.add_argument("--footer-category", choices=["token_economics", "social_proof", "fomo", "cheeky"], help="Footer category filter")
     send_parser.add_argument("--footer-context", choices=["announcement", "discussion"], help="Footer context filter")
     send_parser.add_argument("--skip-duplicate-check", action="store_true", help="Skip duplicate detection")
+    send_parser.add_argument("--no-save-sent", action="store_true", help="Skip saving to Sent folder (overrides default)")
     send_parser.add_argument("--dry-run", action="store_true", help="Validate config without sending")
     send_parser.add_argument("--draft", action="store_true", help="Save to the IMAP Drafts folder instead of sending (requires IMAP)")
     send_parser.add_argument("--draft-folder", help="Explicit Drafts folder name (default: auto-detect via \\Drafts special-use)")
@@ -1634,6 +1647,17 @@ def main() -> int:
     # config subcommand
     subparsers.add_parser("config", help="Validate configuration")
 
+    # search subcommand
+    search_parser = subparsers.add_parser("search", help="Search messages across folders")
+    search_parser.add_argument("--from", dest="from_addr", default=None, help="Filter by sender address or name")
+    search_parser.add_argument("--subject", default=None, help="Filter by subject keyword")
+    search_parser.add_argument("--text", default=None, help="Full-text body search")
+    search_parser.add_argument("--since", default=None, help="Only messages since date (e.g. 17-Apr-2026)")
+    search_parser.add_argument("--unseen", action="store_true", default=False, help="Only unread messages")
+    search_parser.add_argument("--folders", default=None, help="Comma-separated folder list (default: INBOX,INBOX.Processed)")
+    search_parser.add_argument("--limit", type=int, default=20, help="Max results per folder (default: 20)")
+    search_parser.add_argument("--human", action="store_true", help="Human-readable output")
+
     args = parser.parse_args(argv[1:])
 
     if not args.command:
@@ -1658,6 +1682,7 @@ def main() -> int:
         "move": cmd_move,
         "stats": cmd_stats,
         "config": cmd_config,
+        "search": cmd_search,
     }
 
     handler = commands.get(args.command)

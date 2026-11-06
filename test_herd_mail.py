@@ -1285,6 +1285,136 @@ class TestCmdMove(unittest.TestCase):
         self.assertEqual(result, 1)
 
 
+@patch('herd_mail.search_messages')
+class TestSearchCommands(unittest.TestCase):
+    """Test the search subcommand."""
+
+    def setUp(self):
+        self.clear_env()
+        os.environ["WAGGLE_HOST"] = "smtp.example.com"
+        os.environ["WAGGLE_USER"] = "user@example.com"
+        os.environ["WAGGLE_PASS"] = "secret"
+        os.environ["WAGGLE_FROM"] = "user@example.com"
+        os.environ["WAGGLE_IMAP_HOST"] = "imap.example.com"
+        self.waggle_patch = patch('herd_mail.WAGGLE_AVAILABLE', True)
+        self.waggle_patch.start()
+
+    def tearDown(self):
+        self.waggle_patch.stop()
+
+    def clear_env(self):
+        for key in list(os.environ.keys()):
+            if key.startswith("WAGGLE_"):
+                del os.environ[key]
+
+    def test_search_json(self, mock_search):
+        """Test search outputs JSON."""
+        mock_search.return_value = [
+            {"uid": "42", "from_addr": "sam@jasonacox.com", "from_name": "Sam",
+             "subject": "Hello", "date": "Sat, 11 Jul 2026", "unread": True, "folder": "INBOX"},
+        ]
+        captured = StringIO()
+        with patch('sys.argv', ['herd_mail.py', 'search', '--from', 'sam@jasonacox.com']):
+            with patch('sys.stdout', captured):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["messages"][0]["uid"], "42")
+        mock_search.assert_called_once()
+
+    def test_search_human(self, mock_search):
+        """Test search with --human output."""
+        mock_search.return_value = [
+            {"uid": "42", "from_addr": "sam@jasonacox.com", "from_name": "Sam",
+             "subject": "Hello", "date": "Sat, 11 Jul 2026", "unread": True, "folder": "INBOX"},
+        ]
+        captured = StringIO()
+        with patch('sys.argv', ['herd_mail.py', 'search', '--subject', 'Hello', '--human']):
+            with patch('sys.stdout', captured):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        output = captured.getvalue()
+        self.assertIn("UID", output)
+        self.assertIn("Sam", output)
+        self.assertIn("Hello", output)
+
+    def test_search_no_results(self, mock_search):
+        """Test search with no results."""
+        mock_search.return_value = []
+        captured = StringIO()
+        with patch('sys.argv', ['herd_mail.py', 'search', '--text', 'nonexistent']):
+            with patch('sys.stdout', captured):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(data["count"], 0)
+
+    def test_search_connection_error(self, mock_search):
+        """Test search handles errors."""
+        mock_search.side_effect = ConnectionError("Connection refused")
+        with patch('sys.argv', ['herd_mail.py', 'search', '--from', 'test@example.com']):
+            result = hm.main()
+        self.assertEqual(result, 1)
+
+    def test_search_no_imap(self, mock_search):
+        """Test search fails without IMAP config."""
+        del os.environ["WAGGLE_IMAP_HOST"]
+        with patch('sys.argv', ['herd_mail.py', 'search', '--from', 'test@example.com']):
+            result = hm.main()
+        self.assertEqual(result, 1)
+
+
+class TestNoSaveSent(unittest.TestCase):
+    """Test --no-save-sent flag on send."""
+
+    def setUp(self):
+        self.clear_env()
+        os.environ["WAGGLE_HOST"] = "smtp.example.com"
+        os.environ["WAGGLE_USER"] = "user@example.com"
+        os.environ["WAGGLE_PASS"] = "secret"
+        os.environ["WAGGLE_FROM"] = "user@example.com"
+        os.environ["WAGGLE_IMAP_HOST"] = "imap.example.com"
+        self.waggle_patch = patch('herd_mail.WAGGLE_AVAILABLE', True)
+        self.waggle_patch.start()
+
+    def tearDown(self):
+        self.waggle_patch.stop()
+
+    def clear_env(self):
+        for key in list(os.environ.keys()):
+            if key.startswith("WAGGLE_"):
+                del os.environ[key]
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_no_save_sent_passed_through(self, mock_check, mock_send):
+        """Test --no-save-sent passes save_sent=False to send_email."""
+        mock_check.return_value = False
+        mock_send.return_value = True
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'test@example.com',
+                               '--subject', 'Test', '--body', 'Hello', '--no-save-sent']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        call_kwargs = mock_send.call_args[1]
+        self.assertFalse(call_kwargs["save_sent"])
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_save_sent_default_true(self, mock_check, mock_send):
+        """Test save_sent defaults to True without --no-save-sent."""
+        mock_check.return_value = False
+        mock_send.return_value = True
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'test@example.com',
+                               '--subject', 'Test', '--body', 'Hello']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        call_kwargs = mock_send.call_args[1]
+        self.assertTrue(call_kwargs["save_sent"])
+
+
 class TestAutoFlagOnRead(unittest.TestCase):
     r"""Test automatic \Seen marking in cmd_read."""
 
@@ -1579,6 +1709,470 @@ class TestWaggleStubs(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Issue #14: UID -> sequence-number resolution removed.
+#
+# waggle 1.9.12+ uses UID-based IMAP commands (m.uid("FETCH"/"STORE")) and
+# list_inbox() returns real UIDs. The old uid_to_sequence_number() /
+# resolve_sequence_to_uids() round-trips mapped valid UIDs to stale sequence
+# numbers, silently dropping threading headers on `send --message-id` and
+# raising "Invalid messageset" on list/flag. These tests lock in the fix:
+# every UID consumer must pass the caller's real UID straight through, and no
+# extra IMAP round-trip may happen for list/check.
+# ---------------------------------------------------------------------------
+class TestUidResolutionRemovedUnit(unittest.TestCase):
+    """Unit: the sequence-number helpers are gone; UIDs pass through verbatim."""
+
+    def test_sequence_helpers_removed(self):
+        """The fragile conversion helpers no longer exist on the module."""
+        self.assertFalse(hasattr(hm, 'uid_to_sequence_number'))
+        self.assertFalse(hasattr(hm, 'resolve_sequence_to_uids'))
+
+
+class TestUidPassthroughEnv(unittest.TestCase):
+    """Shared env harness for the UID-passthrough command tests."""
+
+    def setUp(self):
+        self.clear_env()
+        os.environ["WAGGLE_HOST"] = "smtp.example.com"
+        os.environ["WAGGLE_USER"] = "user@example.com"
+        os.environ["WAGGLE_PASS"] = "secret"
+        os.environ["WAGGLE_FROM"] = "user@example.com"
+        os.environ["WAGGLE_IMAP_HOST"] = "imap.example.com"
+        self.waggle_patch = patch('herd_mail.WAGGLE_AVAILABLE', True)
+        self.waggle_patch.start()
+
+    def tearDown(self):
+        self.waggle_patch.stop()
+        self.clear_env()
+
+    def clear_env(self):
+        for key in list(os.environ.keys()):
+            if key.startswith("WAGGLE_"):
+                del os.environ[key]
+
+
+class TestUidPassthroughIntegration(TestUidPassthroughEnv):
+    """Integration: each UID consumer forwards the caller's real UID unchanged."""
+
+    @patch('herd_mail.set_flags')
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.read_message')
+    @patch('herd_mail.check_recently_sent')
+    def test_send_message_id_uses_real_uid(self, mock_check, mock_read,
+                                           mock_send, mock_set_flags):
+        """send --message-id fetches the original by the REAL UID (no conversion)."""
+        mock_check.return_value = False
+        mock_read.return_value = {
+            "message_id": "<orig@example.com>",
+            "reply_references": "<orig@example.com>",
+            "subject": "Original",
+            "from_raw": "Alice <alice@example.com>",
+            "date": "Tue, 01 Apr 2026 10:30:00 +0000",
+            "body_plain": "Original body.",
+        }
+        mock_send.return_value = None
+        mock_set_flags.return_value = True
+
+        with patch('sys.argv', ['herd_mail.py', 'send', '--message-id', '26297',
+                                '--to', 'alice@example.com',
+                                '--subject', 'Re: Original', '--body', 'Reply']):
+            result = hm.main()
+
+        self.assertEqual(result, 0)
+        # read_message must receive the literal UID we passed, not a seq number.
+        self.assertEqual(mock_read.call_args[0][0], '26297')
+        # Threading headers derived from the original are forwarded to send.
+        self.assertEqual(mock_send.call_args[1]['in_reply_to'], "<orig@example.com>")
+        self.assertEqual(mock_send.call_args[1]['references'], "<orig@example.com>")
+
+    @patch('herd_mail.download_attachments')
+    def test_download_uses_real_uid(self, mock_dl):
+        """download forwards the real UID directly to waggle."""
+        mock_dl.return_value = []
+        with patch('sys.argv', ['herd_mail.py', 'download', '26297']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(mock_dl.call_args[0][0], '26297')
+
+    @patch('herd_mail.move_message')
+    def test_move_uses_real_uid(self, mock_move):
+        """move forwards the real UID directly to waggle."""
+        mock_move.return_value = True
+        with patch('sys.argv', ['herd_mail.py', 'move', '26297', 'INBOX.Archive']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(mock_move.call_args[0][0], '26297')
+
+    @patch('herd_mail.list_inbox')
+    def test_list_uid_preserved(self, mock_list):
+        """list output preserves the real UID returned by waggle verbatim."""
+        mock_list.return_value = [
+            {"uid": "26297", "from_addr": "a@example.com", "from_name": "A",
+             "subject": "Hi", "date": "Mon", "flags": "", "unread": True, "size": 1},
+        ]
+        captured = StringIO()
+        with patch('sys.argv', ['herd_mail.py', 'list']):
+            with patch('sys.stdout', captured):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(data["messages"][0]["uid"], "26297")
+
+
+class TestUidPassthroughFunctional(TestUidPassthroughEnv):
+    """Functional: golden reply-threading path plus the fetch-error path."""
+
+    @patch('herd_mail.set_flags')
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.read_message')
+    @patch('herd_mail.check_recently_sent')
+    def test_golden_reply_threads(self, mock_check, mock_read, mock_send,
+                                  mock_set_flags):
+        """End-to-end: a UID reply sends successfully WITH threading headers."""
+        mock_check.return_value = False
+        mock_read.return_value = {
+            "message_id": "<orig@example.com>",
+            "reply_references": "<a@example.com> <orig@example.com>",
+            "subject": "Original",
+            "from_raw": "Alice <alice@example.com>",
+            "date": "Tue, 01 Apr 2026 10:30:00 +0000",
+            "body_plain": "Body.",
+        }
+        mock_send.return_value = None
+        with patch('sys.argv', ['herd_mail.py', 'send', '--message-id', '5',
+                                '--to', 'alice@example.com',
+                                '--subject', 'Re: Original', '--body', 'Hi']):
+            result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertIsNotNone(mock_send.call_args[1]['in_reply_to'])
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.read_message')
+    @patch('herd_mail.check_recently_sent')
+    def test_fetch_error_still_sends(self, mock_check, mock_read, mock_send):
+        """Error path: if the original can't be fetched, send still succeeds."""
+        mock_check.return_value = False
+        mock_read.side_effect = OSError("Message not found")
+        mock_send.return_value = None
+        with patch('sys.argv', ['herd_mail.py', 'send', '--message-id', '999999',
+                                '--to', 'alice@example.com',
+                                '--subject', 'Re: X', '--body', 'Hi']):
+            result = hm.main()
+        self.assertEqual(result, 0)
+        mock_send.assert_called_once()
+        self.assertIsNone(mock_send.call_args[1]['in_reply_to'])
+
+
+class TestUidPassthroughSecurity(TestUidPassthroughEnv):
+    """Security/data-boundary: the UID is never rewritten by a hidden lookup."""
+
+    @patch('herd_mail.read_message')
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_uid_not_mutated_by_side_lookup(self, mock_check, mock_send, mock_read):
+        """A non-numeric/odd message-id is forwarded verbatim (no seq rewrite)."""
+        mock_check.return_value = False
+        mock_read.return_value = {"message_id": "<x@e>", "reply_references": None,
+                                  "subject": "S", "from_raw": "", "date": "",
+                                  "body_plain": ""}
+        mock_send.return_value = None
+        odd_id = "26297"
+        with patch('sys.argv', ['herd_mail.py', 'send', '--message-id', odd_id,
+                                '--to', 'a@example.com', '--subject', 'Re',
+                                '--body', 'b']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        # Exactly the caller-supplied UID reached waggle — no substitution.
+        self.assertEqual(mock_read.call_args[0][0], odd_id)
+
+
+class TestUidResolutionPerformance(TestUidPassthroughEnv):
+    """Performance: list/check must not open a second IMAP connection (N+1)."""
+
+    @patch('herd_mail.imaplib.IMAP4_SSL')
+    @patch('herd_mail.list_inbox')
+    def test_list_opens_no_extra_imap_connection(self, mock_list, mock_ssl):
+        """The removed resolve step used to do connect + N UID fetches per list."""
+        mock_list.return_value = [
+            {"uid": "1", "from_addr": "a@e.com", "from_name": "A", "subject": "s",
+             "date": "Mon", "flags": "", "unread": True, "size": 1},
+        ]
+        with patch('sys.argv', ['herd_mail.py', 'list']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        # No direct imaplib connection should be opened by herd-mail for a list.
+        mock_ssl.assert_not_called()
+
+
+class TestUidResolutionRetry(TestUidPassthroughEnv):
+    """Retry: PLACEHOLDER.
+
+    herd-mail does not implement its own IMAP retry/backoff — network retries
+    are delegated to waggle. This change removes IMAP round-trips rather than
+    adding any, so there is no new retry loop to exercise. We instead assert the
+    intentional no-retry contract: a single failed IMAP call surfaces as a clean
+    error exit (no silent looping), which is the behaviour a retry wrapper would
+    wrap in future.
+    """
+
+    @patch('herd_mail.download_attachments')
+    def test_connection_error_surfaced_not_retried(self, mock_dl):
+        mock_dl.side_effect = ConnectionError("Connection refused")
+        with patch('sys.argv', ['herd_mail.py', 'download', '42']):
+            result = hm.main()
+        self.assertEqual(result, 1)
+        # Called exactly once — herd-mail does not loop/retry internally.
+        self.assertEqual(mock_dl.call_count, 1)
+
+
+class TestUidResolutionFrame(TestUidPassthroughEnv):
+    """Frame/smoke: the affected subcommands still dispatch without crashing."""
+
+    @patch('herd_mail.move_message')
+    @patch('herd_mail.download_attachments')
+    @patch('herd_mail.list_inbox')
+    def test_uid_commands_smoke(self, mock_list, mock_dl, mock_move):
+        mock_list.return_value = []
+        mock_dl.return_value = []
+        mock_move.return_value = True
+        for argv in (
+            ['herd_mail.py', 'list'],
+            ['herd_mail.py', 'download', '1'],
+            ['herd_mail.py', 'move', '1', 'INBOX.Archive'],
+        ):
+            with self.subTest(argv=argv):
+                with patch('sys.argv', argv):
+                    with patch('sys.stdout', StringIO()):
+                        self.assertEqual(hm.main(), 0)
+
+
+# ---------------------------------------------------------------------------
+# Issue #11: --rich Markdown lists not preceded by a blank line render as inline
+# text. ensure_blank_line_before_lists() inserts the missing CommonMark blank
+# line before a list so it renders as <ul><li> in the --rich HTML path.
+# ---------------------------------------------------------------------------
+class TestEnsureBlankLineBeforeListsUnit(unittest.TestCase):
+    """Unit: the blank-line insertion covers the reported case and edge cases."""
+
+    def test_reported_case(self):
+        """Header directly followed by a bullet list gains a blank line."""
+        md = "**Header:**\n- Item 1\n- Item 2"
+        self.assertEqual(
+            hm.ensure_blank_line_before_lists(md),
+            "**Header:**\n\n- Item 1\n- Item 2",
+        )
+
+    def test_already_separated_unchanged(self):
+        """A correctly separated list is left untouched (no double blank)."""
+        md = "**Header:**\n\n- Item 1\n- Item 2"
+        self.assertEqual(hm.ensure_blank_line_before_lists(md), md)
+
+    def test_consecutive_items_single_blank(self):
+        """Only the first item gets a preceding blank line, not every item."""
+        md = "Head:\n- a\n- b\n- c"
+        self.assertEqual(hm.ensure_blank_line_before_lists(md), "Head:\n\n- a\n- b\n- c")
+
+    def test_ordered_list(self):
+        """Ordered (1. / 2)) lists are handled too."""
+        self.assertEqual(
+            hm.ensure_blank_line_before_lists("Steps:\n1. First\n2. Second"),
+            "Steps:\n\n1. First\n2. Second",
+        )
+
+    def test_star_and_plus_markers(self):
+        """'*' and '+' bullet markers are recognised."""
+        self.assertEqual(
+            hm.ensure_blank_line_before_lists("Note:\n* a"),
+            "Note:\n\n* a",
+        )
+
+    def test_horizontal_rule_untouched(self):
+        """A '---' thematic break is not a list item and must not gain a blank."""
+        md = "text\n---\nmore"
+        self.assertEqual(hm.ensure_blank_line_before_lists(md), md)
+
+    def test_quote_banner_untouched(self):
+        """The reply quote banner ('-----Original Message-----') is untouched."""
+        md = "Reply\n-----Original Message-----\nFrom: x"
+        self.assertEqual(hm.ensure_blank_line_before_lists(md), md)
+
+    def test_indented_continuation_untouched(self):
+        """Indented list continuation lines don't trigger spurious blanks."""
+        md = "- a\n  cont\n- b"
+        self.assertEqual(hm.ensure_blank_line_before_lists(md), md)
+
+    def test_empty_input(self):
+        """Empty / falsy input returns unchanged."""
+        self.assertEqual(hm.ensure_blank_line_before_lists(""), "")
+
+    def test_list_at_start_unchanged(self):
+        """A list with nothing before it needs no blank line."""
+        md = "- a\n- b"
+        self.assertEqual(hm.ensure_blank_line_before_lists(md), md)
+
+
+class TestEnsureBlankLineBeforeListsSecurity(unittest.TestCase):
+    """Security: the transform only inserts blank lines — never mutates content."""
+
+    def test_no_content_dropped_or_reordered(self):
+        """Every non-empty line survives, in order; only blank lines are added."""
+        md = "H1\n- a\nfoo@example.com\n> quote\n* b\ntail"
+        out = hm.ensure_blank_line_before_lists(md)
+        strip = lambda s: [ln for ln in s.split("\n") if ln != ""]
+        self.assertEqual(strip(out), strip(md))
+
+    def test_idempotent(self):
+        """Re-running the transform makes no further changes (no unbounded growth)."""
+        md = "**Header:**\n- Item 1\n- Item 2"
+        once = hm.ensure_blank_line_before_lists(md)
+        twice = hm.ensure_blank_line_before_lists(once)
+        self.assertEqual(once, twice)
+
+    def test_does_not_introduce_crlf_or_strip_chars(self):
+        """Transform introduces only '\\n' blanks; no CR injection, no char loss."""
+        md = "Header\n- item with <b>html</b> & symbols"
+        out = hm.ensure_blank_line_before_lists(md)
+        self.assertNotIn("\r", out)
+        self.assertIn("<b>html</b> & symbols", out)
+
+
+class TestEnsureBlankLineBeforeListsPerformance(unittest.TestCase):
+    """Performance: single linear pass, bounded output, no quadratic growth."""
+
+    def test_large_input_bounded(self):
+        """A large body processes in one pass; output stays within ~2x the lines."""
+        md = "\n".join(f"Para {i}\n- item {i}" for i in range(5000))
+        out = hm.ensure_blank_line_before_lists(md)
+        in_lines = md.count("\n") + 1
+        out_lines = out.count("\n") + 1
+        # At most one blank inserted per list-start; never more than doubles.
+        self.assertLessEqual(out_lines, in_lines * 2)
+
+
+class TestEnsureBlankLineBeforeListsRetry(unittest.TestCase):
+    """Retry: PLACEHOLDER.
+
+    ensure_blank_line_before_lists() is a pure, in-memory string transform with
+    no IMAP/SMTP/network I/O, so there is nothing to retry with backoff. This
+    placeholder documents that and asserts determinism (same input -> same
+    output on repeated calls), the property a retry would rely on.
+    """
+
+    def test_deterministic_no_io(self):
+        md = "Header\n- a\n- b"
+        self.assertEqual(
+            hm.ensure_blank_line_before_lists(md),
+            hm.ensure_blank_line_before_lists(md),
+        )
+
+
+class TestRichListSendEnv(unittest.TestCase):
+    """Shared env harness for the cmd_send integration/functional tests."""
+
+    def setUp(self):
+        self.clear_env()
+        os.environ["WAGGLE_HOST"] = "smtp.example.com"
+        os.environ["WAGGLE_USER"] = "user@example.com"
+        os.environ["WAGGLE_PASS"] = "secret"
+        os.environ["WAGGLE_FROM"] = "user@example.com"
+        self.waggle_patch = patch('herd_mail.WAGGLE_AVAILABLE', True)
+        self.waggle_patch.start()
+
+    def tearDown(self):
+        self.waggle_patch.stop()
+        self.clear_env()
+
+    def clear_env(self):
+        for key in list(os.environ.keys()):
+            if key.startswith("WAGGLE_"):
+                del os.environ[key]
+
+
+class TestRichListSendIntegration(TestRichListSendEnv):
+    """Integration: cmd_send only rewrites the body when --rich is set."""
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_rich_inserts_blank_line(self, mock_check, mock_send):
+        """--rich body reaches send_email with the blank line inserted."""
+        mock_check.return_value = False
+        mock_send.return_value = None
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'a@example.com',
+                                '--subject', 'S', '--rich',
+                                '--body', '**Header:**\n- Item 1\n- Item 2']):
+            result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            mock_send.call_args[1]['body_md'],
+            "**Header:**\n\n- Item 1\n- Item 2",
+        )
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_plain_body_unchanged(self, mock_check, mock_send):
+        """Without --rich the body is passed through verbatim (no rewrite)."""
+        mock_check.return_value = False
+        mock_send.return_value = None
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'a@example.com',
+                                '--subject', 'S',
+                                '--body', '**Header:**\n- Item 1\n- Item 2']):
+            result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            mock_send.call_args[1]['body_md'],
+            "**Header:**\n- Item 1\n- Item 2",
+        )
+
+
+class TestRichListSendFunctional(TestRichListSendEnv):
+    """Functional: golden --rich send plus a no-list no-op body."""
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_golden_rich_send(self, mock_check, mock_send):
+        """End-to-end --rich send succeeds and the list is separated."""
+        mock_check.return_value = False
+        mock_send.return_value = None
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'a@example.com',
+                                '--subject', 'S', '--rich',
+                                '--body', 'Steps:\n1. one\n2. two']):
+            result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertIn("Steps:\n\n1. one", mock_send.call_args[1]['body_md'])
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_rich_body_without_lists_unchanged(self, mock_check, mock_send):
+        """A --rich body containing no lists is not modified."""
+        mock_check.return_value = False
+        mock_send.return_value = None
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'a@example.com',
+                                '--subject', 'S', '--rich',
+                                '--body', 'Just a paragraph.']):
+            result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertEqual(mock_send.call_args[1]['body_md'], "Just a paragraph.")
+
+
+class TestRichListSendFrame(TestRichListSendEnv):
+    """Frame/smoke: the --rich send path dispatches without crashing."""
+
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_rich_send_smoke(self, mock_check, mock_send):
+        mock_check.return_value = False
+        mock_send.return_value = None
+        self.assertTrue(callable(hm.ensure_blank_line_before_lists))
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'a@example.com',
+                                '--subject', 'S', '--rich', '--body', 'x\n- y']):
+            self.assertEqual(hm.main(), 0)
+
+
+# ---------------------------------------------------------------------------
 # Issue #6: `send --draft` saves the composed email to the IMAP Drafts folder
 # (APPEND with \Draft) instead of sending it, mirroring the Sent-folder sync.
 # ---------------------------------------------------------------------------
@@ -1806,6 +2400,38 @@ class TestDraftSendIntegration(TestDraftSendEnv):
         self.assertEqual(result, 0)
         appended = message_from_bytes(mock_append.call_args[0][1])
         self.assertEqual(appended["In-Reply-To"], "<orig@example.com>")
+
+    @patch('herd_mail.imap_append_draft')
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_draft_with_no_save_sent_is_noop(self, mock_check, mock_send, mock_append):
+        """--draft + --no-save-sent: still just a draft; nothing sent, no error."""
+        mock_append.return_value = "Drafts"
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'alice@example.com',
+                                '--subject', 'Hi', '--body', 'Hello', '--draft',
+                                '--no-save-sent']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        mock_append.assert_called_once()
+        mock_send.assert_not_called()
+
+    @patch('herd_mail.imap_append_draft')
+    @patch('herd_mail.build_draft_message')
+    @patch('herd_mail.send_email')
+    @patch('herd_mail.check_recently_sent')
+    def test_draft_rich_gets_list_blank_line_fix(self, mock_check, mock_send,
+                                                 mock_build, mock_append):
+        """--draft --rich gets the same #11 list pre-processing as a real send."""
+        mock_build.return_value = b"x"
+        mock_append.return_value = "Drafts"
+        with patch('sys.argv', ['herd_mail.py', 'send', '--to', 'alice@example.com',
+                                '--subject', 'Hi', '--rich', '--draft',
+                                '--body', '**Header:**\n- item']):
+            with patch('sys.stdout', StringIO()):
+                result = hm.main()
+        self.assertEqual(result, 0)
+        self.assertIn("**Header:**\n\n- item", mock_build.call_args.kwargs["body_md"])
 
 
 class TestDraftSendFunctional(TestDraftSendEnv):

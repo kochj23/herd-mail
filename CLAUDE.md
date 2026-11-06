@@ -8,7 +8,7 @@ herd-mail is a CLI wrapper for [waggle](https://github.com/jasonacox-sam/waggle-
 
 This is a standalone Python script, not a package. No build system or setup.py required.
 
-**Version 3.1**: Subcommand-based CLI (`send`, `list`, `read`, `check`, `download`, `flag`, `move`, `config`). JSON-first output for AI agents (stdout=JSON, stderr=logging). Version tracked via `__version__` in `herd_mail.py`, `--version` flag, and `config` output. Keep `__version__` and `pyproject.toml` version in sync.
+**Version 3.5**: Subcommand-based CLI (`send`, `list`, `read`, `check`, `download`, `flag`, `move`, `stats`, `config`, `search`). JSON-first output for AI agents (stdout=JSON, stderr=logging). `--human` for readable output. Version tracked via `__version__` in `herd_mail.py`, `--version` flag, and `config` output. Keep `__version__` and `pyproject.toml` version in sync.
 
 ## Development Commands
 
@@ -96,6 +96,10 @@ Auto-flag operations are non-fatal (warning on failure, command still succeeds).
 ### Sent Folder Sync
 
 `save_to_sent()` is herd-mail's own IMAP APPEND implementation (not waggle). It saves a plain-text copy to the Sent folder after sending. Folder discovery tries candidates: `Sent`, `Sent Items`, `INBOX.Sent`. Failures are non-fatal.
+
+### Drafts (`send --draft`)
+
+`build_draft_message()` + `imap_append_draft()` build the same message `send_email()` would (reusing waggle's Markdown renderers) and IMAP-APPEND it to Drafts with `\Draft` instead of sending. Folder: `--draft-folder`, else RFC 6154 `\Drafts` special-use, else `DRAFTS_FOLDER_CANDIDATES`. Draft mode skips SMTP, the duplicate check, the footer, Sent sync, and auto-flagging; `--no-save-sent` is a no-op with it. Unlike Sent sync, a failed draft append is fatal (exit 1).
 
 ### Output Design
 
